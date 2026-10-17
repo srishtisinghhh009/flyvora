@@ -1,5 +1,6 @@
 import React, { useId, useState } from 'react';
 import { CheckCircle2, MessageCircle, Send } from 'lucide-react';
+import { submitLead } from '../api/leads';
 
 /**
  * WhatsApp number that receives quote requests.
@@ -25,7 +26,7 @@ interface TaxiQuoteFormProps {
   /** Pre-fill pickup/drop (used by the popular routes list). */
   initialPickup?: string;
   initialDrop?: string;
-  /** Called after a valid submit. Later this is where the API call goes. */
+  /** Called after the request was saved on the server. */
   onSubmitted?: (data: TaxiQuoteRequest) => void;
 }
 
@@ -79,6 +80,8 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
   const [message, setMessage] = useState('');
   const [errors, setErrors] = useState<FormErrors>({});
   const [submitted, setSubmitted] = useState<TaxiQuoteRequest | null>(null);
+  const [sending, setSending] = useState(false);
+  const [serverError, setServerError] = useState('');
 
   const validate = (needContact: boolean): FormErrors => {
     const e: FormErrors = {};
@@ -96,8 +99,9 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
 
   const vehicleLabel = VEHICLE_CHOICES.find(v => v.value === vehicleType)?.label ?? vehicleType;
 
-  const handleSubmit = (ev: React.FormEvent) => {
+  const handleSubmit = async (ev: React.FormEvent) => {
     ev.preventDefault();
+    if (sending) return;
     const e = validate(true);
     setErrors(e);
     if (Object.keys(e).length > 0) return;
@@ -115,10 +119,17 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
       message: message.trim()
     };
 
-    // Temporary: no backend yet. Replace with an API call later.
-    console.log('Taxi quote request', data);
-    onSubmitted?.(data);
-    setSubmitted(data);
+    setSending(true);
+    setServerError('');
+    try {
+      await submitLead({ ...data, source: 'taxi-form' });
+      onSubmitted?.(data);
+      setSubmitted(data);
+    } catch (err) {
+      setServerError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
+    } finally {
+      setSending(false);
+    }
   };
 
   const handleWhatsApp = () => {
@@ -144,6 +155,7 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
   const resetForm = () => {
     setSubmitted(null);
     setErrors({});
+    setServerError('');
     setTravelDate('');
     setPickupTime('');
     setMessage('');
@@ -170,9 +182,6 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
           <div><dt className="inline font-semibold">Date: </dt><dd className="inline">{submitted.travelDate}{submitted.pickupTime ? ` at ${submitted.pickupTime}` : ''}</dd></div>
           <div><dt className="inline font-semibold">Passengers: </dt><dd className="inline">{submitted.passengers}</dd></div>
         </dl>
-        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 mb-5">
-          Demo notice: this request is not saved anywhere yet. Use the WhatsApp button to reach us for now.
-        </p>
         <button
           type="button"
           onClick={resetForm}
@@ -261,10 +270,11 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
       <div className="flex flex-col sm:flex-row gap-3 pt-1">
         <button
           type="submit"
-          className="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-[#FF5500] text-white text-sm font-semibold hover:bg-[#e64d00] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#FF5500]"
+          disabled={sending}
+          className="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-[#FF5500] text-white text-sm font-semibold hover:bg-[#e64d00] disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#FF5500]"
         >
           <Send className="w-4 h-4" aria-hidden="true" />
-          Request a quote
+          {sending ? 'Sending...' : 'Request a quote'}
         </button>
         <button
           type="button"
@@ -275,6 +285,11 @@ export const TaxiQuoteForm: React.FC<TaxiQuoteFormProps> = ({
           Get quote on WhatsApp
         </button>
       </div>
+      {serverError && (
+        <p role="alert" className="text-sm text-red-600">
+          {serverError}
+        </p>
+      )}
       <p className="text-xs text-slate-500">We'll share the final price within 1 hour.</p>
     </form>
   );

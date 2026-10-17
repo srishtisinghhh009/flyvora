@@ -21,3 +21,11 @@ export function cleanIndianPhone(raw: string): string | null {
 export function isValidEmail(raw: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw.trim());
 }
+
+/** A date N days from today as YYYY-MM-DD (local timezone). Used for sensible default dates. */
+export function dateFromToday(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}

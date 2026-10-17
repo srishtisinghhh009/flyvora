@@ -25,3 +25,4 @@ To check types and create a production build:
 npm run lint
 npm run build
 ```
+    
