@@ -1,5 +1,13 @@
-import React, { useState } from 'react';
-import { X, CheckCircle2, ShieldAlert, ArrowRight, User, Mail, Phone, Calendar, Users, DollarSign, Sparkles } from 'lucide-react';
+import React, { useEffect, useId, useRef, useState } from 'react';
+import { CheckCircle2, Send, X } from 'lucide-react';
+import { cleanIndianPhone, isValidEmail, todayLocal } from '../utils/forms';
+import { submitLead } from '../api/leads';
+
+/**
+ * Enquiry modal for hotels, tour packages and wishlist items.
+ * It keeps the same props as the old booking modal, so App.tsx needs no change.
+ * Nothing is booked or paid here: the visitor sends an enquiry and we reply with a confirmed price.
+ */
 
 interface BookingModalProps {
   isOpen: boolean;
@@ -13,289 +21,264 @@ interface BookingModalProps {
   } | null;
 }
 
-export const BookingModal: React.FC<BookingModalProps> = ({
-  isOpen,
-  onClose,
-  bookingData
-}) => {
-  const [step, setStep] = useState<'details' | 'review' | 'confirmed'>('details');
+export interface EnquiryRequest {
+  type: 'enquiry';
+  itemTitle: string;
+  itemType: string;
+  name: string;
+  phone: string;
+  email: string;
+  travelDate: string;
+  travelers: number;
+  message: string;
+}
+
+type Errors = Partial<Record<'name' | 'phone' | 'email' | 'travelDate' | 'travelers', string>>;
+
+const inputClass =
+  'w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl text-slate-800 ' +
+  'placeholder:text-slate-400 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[#FF5500]';
+const labelClass = 'block text-xs font-semibold text-slate-700 mb-1.5';
+
+export const BookingModal: React.FC<BookingModalProps> = ({ isOpen, onClose, bookingData }) => {
+  const uid = useId();
+  const id = (n: string) => `${uid}-${n}`;
+
   const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
-  const [travelDate, setTravelDate] = useState('2026-11-15');
-  const [travelersCount, setTravelersCount] = useState(2);
-  const [specialRequests, setSpecialRequests] = useState('');
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [email, setEmail] = useState('');
+  const [travelDate, setTravelDate] = useState('');
+  const [travelers, setTravelers] = useState(2);
+  const [message, setMessage] = useState('');
+  const [errors, setErrors] = useState<Errors>({});
+  const [sent, setSent] = useState<EnquiryRequest | null>(null);
+  const [sending, setSending] = useState(false);
+  const [serverError, setServerError] = useState('');
+
+  const panelRef = useRef<HTMLDivElement>(null);
+  const firstFieldRef = useRef<HTMLInputElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  // App.tsx passes a new onClose function on every render; keep it in a ref so the effect below runs once per open.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Reset the form each time the modal opens for an item.
+  useEffect(() => {
+    if (isOpen) {
+      setName('');
+      setPhone('');
+      setEmail('');
+      setTravelDate('');
+      setTravelers(2);
+      setMessage('');
+      setErrors({});
+      setSent(null);
+      setSending(false);
+      setServerError('');
+    }
+  }, [isOpen, bookingData?.title]);
+
+  // Escape to close, lock page scroll, move focus in, return focus on close.
+  useEffect(() => {
+    if (!isOpen) return;
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCloseRef.current();
+    };
+    document.addEventListener('keydown', onKey);
+    const t = window.setTimeout(() => firstFieldRef.current?.focus(), 0);
+
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = previousOverflow;
+      window.clearTimeout(t);
+      returnFocusRef.current?.focus?.();
+    };
+  }, [isOpen]);
 
   if (!isOpen || !bookingData) return null;
 
-  const basePrice = bookingData.pricePerUnit || 15000;
-  const subtotal = basePrice * travelersCount;
-  const gstTax = Math.round(subtotal * 0.05); // 5% GST
-  const grandTotal = subtotal + gstTax;
+  const isHotel = /hotel/i.test(bookingData.type);
+  const guestsLabel = isHotel ? 'Guests' : 'Travelers';
+  const dateLabel = isHotel ? 'Check-in date' : 'Preferred travel date';
 
-  const validate = () => {
-    const errs: Record<string, string> = {};
-    if (!name.trim()) errs.name = 'Please enter traveler full name.';
-    if (!email.trim() || !email.includes('@')) errs.email = 'Please enter a valid email address.';
-    if (!phone.trim()) errs.phone = 'Please enter a mobile contact number.';
-    setErrors(errs);
-    return Object.keys(errs).length === 0;
+  const validate = (): Errors => {
+    const e: Errors = {};
+    if (name.trim().length < 2) e.name = 'Enter your name.';
+    if (!cleanIndianPhone(phone)) e.phone = 'Enter a valid 10-digit mobile number.';
+    if (email.trim() && !isValidEmail(email)) e.email = 'Enter a valid email address or leave it empty.';
+    if (!travelDate) e.travelDate = 'Choose a date.';
+    else if (travelDate < todayLocal()) e.travelDate = 'The date cannot be in the past.';
+    if (!Number.isFinite(travelers) || travelers < 1 || travelers > 30) {
+      e.travelers = `${guestsLabel} must be between 1 and 30.`;
+    }
+    return e;
   };
 
-  const handleProceedToReview = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (validate()) {
-      setStep('review');
+  const handleSubmit = async (ev: React.FormEvent) => {
+    ev.preventDefault();
+    if (sending) return;
+    const e = validate();
+    setErrors(e);
+    if (Object.keys(e).length > 0) return;
+
+    const data: EnquiryRequest = {
+      type: 'enquiry',
+      itemTitle: bookingData.title,
+      itemType: bookingData.type,
+      name: name.trim(),
+      phone: cleanIndianPhone(phone)!,
+      email: email.trim(),
+      travelDate,
+      travelers,
+      message: message.trim()
+    };
+
+    setSending(true);
+    setServerError('');
+    try {
+      await submitLead({ ...data, source: 'enquiry-modal' });
+      setSent(data);
+    } catch (err) {
+      setServerError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
+    } finally {
+      setSending(false);
     }
   };
 
-  const handleConfirmDemo = () => {
-    setStep('confirmed');
-  };
-
-  const handleClose = () => {
-    setStep('details');
-    onClose();
-  };
+  const err = (f: keyof Errors) =>
+    errors[f] ? <p id={id(`${f}-err`)} className="text-xs text-red-600 mt-1">{errors[f]}</p> : null;
+  const aria = (f: keyof Errors) => ({
+    'aria-invalid': errors[f] ? true : undefined,
+    'aria-describedby': errors[f] ? id(`${f}-err`) : undefined
+  });
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6 animate-in fade-in duration-200">
-      <div 
-        className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 relative my-6"
-        onClick={(e) => e.stopPropagation()}
+    <div
+      className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center bg-slate-900/60 p-0 sm:p-4"
+      onMouseDown={e => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={id('title')}
+        className="relative w-full sm:max-w-lg max-h-[92vh] overflow-y-auto bg-white rounded-t-3xl sm:rounded-3xl shadow-xl"
       >
-        {/* Close Button */}
         <button
-          onClick={handleClose}
-          className="absolute top-4 right-4 z-20 p-2 text-slate-400 hover:text-slate-800 bg-white/80 rounded-full transition-colors"
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="absolute top-3 right-3 p-2 rounded-xl text-slate-500 hover:bg-slate-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-[#FF5500]"
         >
-          <X className="w-5 h-5" />
+          <X className="w-5 h-5" aria-hidden="true" />
         </button>
 
-        {/* Modal Header */}
-        <div className="p-6 bg-slate-900 text-white border-b border-slate-800">
-          <div className="text-xs font-bold text-orange-400 uppercase tracking-wider">
-            Demo Travel Reservation & Enquiry
+        {sent ? (
+          <div role="status" className="p-6 sm:p-8">
+            <div className="flex items-center gap-2 text-emerald-600 font-semibold mb-2">
+              <CheckCircle2 className="w-5 h-5" aria-hidden="true" />
+              Enquiry received
+            </div>
+            <h2 id={id('title')} className="font-display text-xl font-bold text-slate-900 mb-2">
+              Thanks, {sent.name.split(' ')[0]}.
+            </h2>
+            <p className="text-sm text-slate-600 mb-1">
+              We'll contact you shortly on {sent.phone} with availability and the final price for{' '}
+              <span className="font-semibold">{sent.itemTitle}</span>.
+            </p>
+            <p className="text-xs text-slate-500 my-5">
+              Nothing has been booked or charged yet. We will confirm availability and the final price first.
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-5 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-slate-900"
+            >
+              Close
+            </button>
           </div>
-          <h2 className="text-xl sm:text-2xl font-bold font-display mt-0.5">
-            {bookingData.title}
-          </h2>
-          {bookingData.subtext && (
-            <p className="text-xs text-slate-300 mt-1">{bookingData.subtext}</p>
-          )}
-
-          {/* Step indicator */}
-          <div className="flex items-center gap-2 mt-4 text-xs font-medium">
-            <span className={`px-2.5 py-1 rounded-full ${step === 'details' ? 'bg-[#FF5500] text-white' : 'bg-white/20 text-slate-300'}`}>
-              1. Traveler Details
-            </span>
-            <span className="text-slate-600">→</span>
-            <span className={`px-2.5 py-1 rounded-full ${step === 'review' ? 'bg-[#FF5500] text-white' : 'bg-white/20 text-slate-300'}`}>
-              2. Review & Confirm
-            </span>
-            <span className="text-slate-600">→</span>
-            <span className={`px-2.5 py-1 rounded-full ${step === 'confirmed' ? 'bg-emerald-600 text-white' : 'bg-white/20 text-slate-300'}`}>
-              3. Demo Confirmation
-            </span>
-          </div>
-        </div>
-
-        {/* Notice Banner */}
-        <div className="p-3 bg-amber-50/90 border-b border-amber-200 text-[11px] text-amber-900 flex items-center gap-2">
-          <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
-          <span>
-            <strong>Frontend Demo Only:</strong> No financial transaction or payment card is requested. Submitting this flow generates a simulated confirmation.
-          </span>
-        </div>
-
-        {/* Step 1: Details */}
-        {step === 'details' && (
-          <form onSubmit={handleProceedToReview} className="p-6 space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-700">Lead Traveler Full Name *</label>
-                <input
-                  type="text"
-                  placeholder="e.g. Priya Iyer"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500]"
-                />
-                {errors.name && <span className="text-[11px] text-red-500">{errors.name}</span>}
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-700">Email Address *</label>
-                <input
-                  type="email"
-                  placeholder="name@example.com"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500]"
-                />
-                {errors.email && <span className="text-[11px] text-red-500">{errors.email}</span>}
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-700">Phone Number *</label>
-                <input
-                  type="tel"
-                  placeholder="+91 98765 43210"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                  className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500]"
-                />
-                {errors.phone && <span className="text-[11px] text-red-500">{errors.phone}</span>}
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-700">Travel Date</label>
-                <input
-                  type="date"
-                  value={travelDate}
-                  onChange={(e) => setTravelDate(e.target.value)}
-                  className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500]"
-                />
-              </div>
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Number of Travelers</label>
-              <input
-                type="number"
-                min="1"
-                max="20"
-                value={travelersCount}
-                onChange={(e) => setTravelersCount(Math.max(1, Number(e.target.value)))}
-                className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500] tabular-nums"
-              />
-            </div>
-
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Special Notes or Room Preferences</label>
-              <textarea
-                rows={2}
-                placeholder="Vegetarian meals, ground floor room, airport pickup timing, etc."
-                value={specialRequests}
-                onChange={(e) => setSpecialRequests(e.target.value)}
-                className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-[#FF5500]"
-              />
-            </div>
-
-            <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
-              <div className="text-xs text-slate-500">
-                Estimated Subtotal: <strong className="text-slate-900 tabular-nums">₹{subtotal.toLocaleString('en-IN')}</strong>
-              </div>
-
-              <button
-                type="submit"
-                className="px-5 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-[#FF5500] rounded-lg transition-colors flex items-center gap-1.5"
-              >
-                <span>Continue to Review</span>
-                <ArrowRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* Step 2: Review */}
-        {step === 'review' && (
-          <div className="p-6 space-y-5">
-            <h3 className="text-sm font-bold text-slate-900">Review Reservation Summary</h3>
-
-            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2 text-xs">
-              <div className="flex justify-between">
-                <span className="text-slate-500">Item:</span>
-                <span className="font-bold text-slate-900">{bookingData.title}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Lead Traveler:</span>
-                <span className="font-semibold text-slate-800">{name} ({phone})</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Date & Travelers:</span>
-                <span className="font-semibold text-slate-800">{travelDate} · {travelersCount} Travelers</span>
-              </div>
-              {specialRequests && (
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Special Notes:</span>
-                  <span className="font-semibold text-slate-800">{specialRequests}</span>
-                </div>
+        ) : (
+          <form onSubmit={handleSubmit} noValidate className="p-6 sm:p-8 space-y-4">
+            <div className="pr-8">
+              <p className="text-xs font-semibold text-[#FF5500] mb-1">Enquire about</p>
+              <h2 id={id('title')} className="font-display text-xl font-bold text-slate-900">
+                {bookingData.title}
+              </h2>
+              {bookingData.subtext && (
+                <p className="text-sm text-slate-600 mt-1">{bookingData.subtext}</p>
               )}
+              {bookingData.pricePerUnit ? (
+                <p className="text-xs text-slate-500 mt-2">
+                  Indicative rate from ₹{bookingData.pricePerUnit.toLocaleString('en-IN')}. We confirm the
+                  final price and availability after your enquiry.
+                </p>
+              ) : null}
             </div>
 
-            {/* Price breakdown table */}
-            <div className="p-4 rounded-xl border border-slate-200 space-y-2 text-xs text-slate-600">
-              <div className="flex justify-between">
-                <span>Base Rate (₹{basePrice.toLocaleString('en-IN')} × {travelersCount}):</span>
-                <span className="font-semibold tabular-nums text-slate-800">₹{subtotal.toLocaleString('en-IN')}</span>
+            <div className="grid sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor={id('name')} className={labelClass}>Your name</label>
+                <input ref={firstFieldRef} id={id('name')} className={inputClass} value={name}
+                  autoComplete="name" onChange={e => setName(e.target.value)} {...aria('name')} />
+                {err('name')}
               </div>
-              <div className="flex justify-between">
-                <span>Taxes & GST (5%):</span>
-                <span className="font-semibold tabular-nums text-slate-800">₹{gstTax.toLocaleString('en-IN')}</span>
+              <div>
+                <label htmlFor={id('phone')} className={labelClass}>Mobile number</label>
+                <input id={id('phone')} className={inputClass} value={phone} type="tel" inputMode="tel"
+                  autoComplete="tel" placeholder="98XXXXXXXX" onChange={e => setPhone(e.target.value)}
+                  {...aria('phone')} />
+                {err('phone')}
               </div>
-              <div className="pt-2 border-t border-slate-200 flex justify-between font-bold text-sm text-slate-900">
-                <span>Total Indicative Amount:</span>
-                <span className="tabular-nums text-base text-[#FF5500]">₹{grandTotal.toLocaleString('en-IN')}</span>
+              <div className="sm:col-span-2">
+                <label htmlFor={id('email')} className={labelClass}>Email (optional)</label>
+                <input id={id('email')} className={inputClass} value={email} type="email"
+                  autoComplete="email" onChange={e => setEmail(e.target.value)} {...aria('email')} />
+                {err('email')}
               </div>
-            </div>
-
-            <div className="pt-2 flex items-center justify-between">
-              <button
-                type="button"
-                onClick={() => setStep('details')}
-                className="text-xs text-slate-500 hover:text-slate-800 font-semibold"
-              >
-                ← Back to Edit
-              </button>
-
-              <button
-                type="button"
-                onClick={handleConfirmDemo}
-                className="px-6 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-[#FF5500] to-[#FF3D00] hover:from-[#e64d00] rounded-lg shadow-md transition-all flex items-center gap-1.5"
-              >
-                <span>Confirm Demo Booking</span>
-                <CheckCircle2 className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Step 3: Confirmation */}
-        {step === 'confirmed' && (
-          <div className="p-8 text-center space-y-5">
-            <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
-              <CheckCircle2 className="w-10 h-10" />
+              <div>
+                <label htmlFor={id('date')} className={labelClass}>{dateLabel}</label>
+                <input id={id('date')} type="date" className={inputClass} value={travelDate}
+                  min={todayLocal()} onChange={e => setTravelDate(e.target.value)} {...aria('travelDate')} />
+                {err('travelDate')}
+              </div>
+              <div>
+                <label htmlFor={id('guests')} className={labelClass}>{guestsLabel}</label>
+                <input id={id('guests')} type="number" min={1} max={30} className={inputClass}
+                  value={travelers} onChange={e => setTravelers(parseInt(e.target.value, 10))}
+                  {...aria('travelers')} />
+                {err('travelers')}
+              </div>
             </div>
 
             <div>
-              <div className="text-xs font-bold text-emerald-600 uppercase tracking-widest">
-                Demo Reservation Verified
-              </div>
-              <h3 className="text-2xl font-bold text-slate-900 font-display mt-1">
-                Booking Reference: #FLY-{Math.floor(100000 + Math.random() * 900000)}
-              </h3>
-              <p className="text-xs text-slate-500 mt-2 max-w-sm mx-auto">
-                A simulated confirmation was logged for <strong>{name}</strong> for <strong>{bookingData.title}</strong> on <strong>{travelDate}</strong>.
-              </p>
-            </div>
-
-            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-600 max-w-md mx-auto text-left space-y-1">
-              <div><strong>Status:</strong> Demo Prototype Confirmation</div>
-              <div><strong>Payment:</strong> ₹0 charged (frontend-only environment)</div>
-              <div><strong>Email Dispatch:</strong> Stored locally in prototype memory</div>
+              <label htmlFor={id('msg')} className={labelClass}>Anything else? (optional)</label>
+              <textarea id={id('msg')} rows={3} className={inputClass} value={message}
+                placeholder="Room preference, number of nights, special requests..."
+                onChange={e => setMessage(e.target.value)} />
             </div>
 
             <button
-              onClick={handleClose}
-              className="px-6 py-2.5 text-xs font-bold text-white bg-slate-900 hover:bg-[#FF5500] rounded-lg transition-colors"
+              type="submit"
+              disabled={sending}
+              className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-[#FF5500] text-white text-sm font-semibold hover:bg-[#e64d00] disabled:opacity-60 disabled:cursor-not-allowed focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#FF5500]"
             >
-              Return to Platform
+              <Send className="w-4 h-4" aria-hidden="true" />
+              {sending ? 'Sending...' : 'Send enquiry'}
             </button>
-          </div>
+            {serverError && (
+              <p role="alert" className="text-sm text-red-600">
+                {serverError}
+              </p>
+            )}
+            <p className="text-xs text-slate-500">No payment is taken. We reply with availability and a final price.</p>
+          </form>
         )}
-
       </div>
     </div>
   );
